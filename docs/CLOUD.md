@@ -51,77 +51,41 @@ from google.colab import drive
 drive.mount('/content/drive')
 ```
 
-**Cell 2 — Vulkan + Deno + Node + repo:**
+**Cell 2 — clone + setup** (`scripts/colab-setup.sh` installs Vulkan and the
+NVIDIA ICD, Deno, Node 22, pnpm, and project deps; symlinks `checkpoints/`
+into Drive; and validates the GPU kernels bit-for-bit against the CPU engine —
+it exits loudly if Vulkan only sees `llvmpipe`, i.e. CPU):
 
 ```bash
-%%bash
-set -e
-apt-get -qq update && apt-get -qq install -y libvulkan1 vulkan-tools > /dev/null
-# Colab's minimal NVIDIA driver install often lacks the Vulkan ICD; add it.
-DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | cut -d. -f1)
-apt-get -qq install -y libnvidia-gl-${DRIVER} > /dev/null || true
-mkdir -p /usr/share/vulkan/icd.d
-cat > /usr/share/vulkan/icd.d/nvidia_icd.json <<'EOF'
-{"file_format_version":"1.0.0","ICD":{"library_path":"libGLX_nvidia.so.0","api_version":"1.3.194"}}
-EOF
-vulkaninfo --summary | grep -A2 deviceName   # MUST list Tesla T4, not llvmpipe
-curl -fsSL https://deno.land/install.sh | sh > /dev/null
-curl -fsSL https://deb.nodesource.com/setup_22.x | bash - > /dev/null && apt-get -qq install -y nodejs > /dev/null
-npm install -g pnpm > /dev/null
-git clone https://github.com/leofattal/turt.git /content/turt
-cd /content/turt && pnpm install
-mkdir -p /content/drive/MyDrive/turt-checkpoints
-ln -s /content/drive/MyDrive/turt-checkpoints /content/turt/checkpoints
+!git clone https://github.com/leofattal/turt.git /content/turt
+!bash /content/turt/scripts/colab-setup.sh
 ```
 
-If `vulkaninfo` shows only `llvmpipe`, WebGPU would silently run on CPU — stop
-and debug that line first (the ICD hack above is the usual fix).
-
-**Cell 3 — validate the GPU backend (bit-for-bit vs the CPU engine):**
+**Cell 3 — benchmark (~10 min on top of the one-time ~1h corpus build):**
 
 ```bash
-%%bash
-cd /content/turt && export PATH="$HOME/.deno/bin:$PATH"
-pnpm gpu-gpt
+!STEPS=100 bash /content/turt/scripts/colab-train.sh
 ```
 
-**Cell 4 — build the corpus (~1h; then stash it on Drive so restarts skip this):**
+`colab-train.sh` restores the corpus from a Drive tarball — or on the very
+first run builds 3GB of C4 (~0.7B tokens) and stashes the tarball — then
+trains. `STEPS=100` makes it stop after 100 steps: read the printed `tok/s`,
+then `0.7e9 / tokPerSec / 3600` is the total GPU-hours for the full run.
+If `nvidia-smi` shows plenty of free memory, benchmark again with
+`STEPS=200 BATCH=16` — bigger batch is almost always more tok/s (at batch 16,
+halve STEPS to keep the token budget).
+
+**Cell 4 — the real run (resumes from the checkpoint; rerun after any disconnect):**
 
 ```bash
-%%bash
-cd /content/turt && pnpm prepare-data-big --target-gb 3
-tar cf /content/drive/MyDrive/turt-data-big.tar data-big/tokenizer.json data-big/meta.json data-big/train.bin data-big/val.bin
+!bash /content/turt/scripts/colab-train.sh
 ```
 
-On a restarted session, restore instead of rebuilding:
-`tar xf /content/drive/MyDrive/turt-data-big.tar -C /content/turt`.
-
-**Cell 5 — benchmark (~5 min), then read the `tok/s` it prints:**
-
-```bash
-%%bash
-cd /content/turt && export PATH="$HOME/.deno/bin:$PATH"
-pnpm gpu-pretrain --data data-big --layers 8 --heads 8 --embd 512 --block 512 \
-  --batch 8 --steps 100 --out bench.bin
-```
-
-If memory allows (watch `nvidia-smi`), retry with `--batch 16` — bigger batch
-is almost always more tok/s. Chinchilla target for this 33M-param shape is
-~0.7B tokens; at batch 8 × block 512 that is `STEPS=160000`, and
-`0.7e9 / tokPerSec / 3600` tells you the total GPU-hours before you start.
-
-**Cell 6 — the real run (survives crashes; rerun after any disconnect):**
-
-```bash
-%%bash
-cd /content/turt && export PATH="$HOME/.deno/bin:$PATH"
-LAYERS=8 HEADS=8 EMBD=512 BLOCK=512 BATCH=8 STEPS=160000 \
-  DATA=data-big OUT=turt-c4-33m.bin bash scripts/gpu-pretrain-loop.sh
-```
-
+Defaults: 33M params (`LAYERS=8 HEADS=8 EMBD=512 BLOCK=512 BATCH=8`),
+`STEPS=160000` ≈ 0.66B tokens, output `turt-c4-33m.bin`. All env-overridable.
 Because `checkpoints/` is a symlink into Drive, every 500-step checkpoint is
-safe. When a session dies: reopen, rerun cells 1–3, restore the data tar
-(cell 4's note), rerun cell 6 — it resumes where it stopped.
+safe. When a session dies: reopen, rerun cells 1, 2, and 4 — it resumes where
+it stopped (the 100 benchmark steps count toward the run, too).
 
 A modest step up that still fits a T4: `LAYERS=10 HEADS=10 EMBD=640` (~60M
 params, ~1.2B-token Chinchilla target — likely a multi-week free-tier project;
