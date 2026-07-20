@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { GPT, Tensor, mulberry32 } from "../../src/index.js";
-import { loadCheckpoint, saveCheckpoint } from "../../scripts/checkpoint.js";
+import { loadCheckpoint, readCheckpointMeta, saveCheckpoint } from "../../scripts/checkpoint.js";
 import { flattenGrads, flattenParams, loadGrads, loadParams } from "../../scripts/params.js";
 
 const config = { vocabSize: 32, blockSize: 8, nLayer: 2, nHead: 2, nEmbd: 16 };
@@ -104,5 +104,42 @@ describe("flat parameter views (data-parallel transport)", () => {
     for (let i = 0; i < expected.length; i++) {
       expect(accumulated[i]).toBeCloseTo(expected[i], 5);
     }
+  });
+});
+
+describe("checkpoint architecture round-trip", () => {
+  it("preserves arch through save/load so a resumed model keeps its shape", async () => {
+    const modern = { ...config, arch: "modern" as const };
+    const saved = new GPT(modern, mulberry32(1));
+    const path = join(dir, "modern.bin");
+    await saveCheckpoint(path, saved, 42, 1.5);
+
+    const meta = await readCheckpointMeta(path);
+    expect(meta.config.arch).toBe("modern");
+    expect(meta.step).toBe(42);
+
+    const loaded = new GPT(meta.config, mulberry32(2));
+    await loadCheckpoint(path, loaded);
+    const a = saved.parameters();
+    const b = loaded.parameters();
+    expect(b).toHaveLength(a.length);
+    for (let i = 0; i < a.length; i++) expect(b[i].toArray()).toEqual(a[i].toArray());
+  });
+
+  it("reads a header without loading weights", async () => {
+    const path = join(dir, "hdr.bin");
+    await saveCheckpoint(path, new GPT(config, mulberry32(3)), 7, 2.25);
+    const meta = await readCheckpointMeta(path);
+    expect(meta.config.nLayer).toBe(config.nLayer);
+    expect(meta.bestValLoss).toBe(2.25);
+    // Absent arch means the original shape, so pre-arch checkpoints still load.
+    expect(meta.config.arch).toBeUndefined();
+  });
+
+  it("refuses to load a checkpoint into a model of the wrong architecture", async () => {
+    const path = join(dir, "mismatch.bin");
+    await saveCheckpoint(path, new GPT({ ...config, arch: "modern" }, mulberry32(4)), 1, 1);
+    // A gpt2 model has more parameters (wpe + biases); loading must fail loudly.
+    await expect(loadCheckpoint(path, new GPT(config, mulberry32(5)))).rejects.toThrow();
   });
 });

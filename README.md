@@ -2,7 +2,7 @@
 
 A modular AI foundation platform built **from first principles** in TypeScript — tensor math, automatic differentiation, neural networks, optimizers, tokenization, training, inference backends, long-term memory, and tool use. No ML framework dependencies.
 
-It includes a working **GPT** — a decoder-only transformer in the GPT-2 / nanoGPT shape — trained on 60 MB of Project Gutenberg text. Every layer, the autodiff that trains it, and the BPE tokenizer that feeds it are implemented here from scratch.
+It includes a working **GPT** — a decoder-only transformer with the architecture modern small language models converged on (RMSNorm, SwiGLU, RoPE, no biases; the original GPT-2 shape is still selectable with `--arch gpt2`) — trained on Project Gutenberg text. Every layer, the autodiff that trains it, and the BPE tokenizer that feeds it are implemented here from scratch.
 
 See [PRD.md](./PRD.md) for the product vision, [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for the codebase map, and [docs/TRAINING.md](./docs/TRAINING.md) for the full training pipeline.
 
@@ -18,18 +18,39 @@ pnpm build       # compile to dist/
 ## Train a language model
 
 ```bash
-pnpm prepare-data                 # 73 Gutenberg books -> 60 MB -> 24.7M BPE tokens
-pnpm train --steps 6500           # data-parallel across CPU cores
+pnpm prepare-data                 # 550 Gutenberg books -> 250 MB -> 77.7M BPE tokens (vocab 8192)
+pnpm train --steps 6500           # CPU: data-parallel across cores (~2M-param ceiling)
 pnpm generate --prompt "It was a" # sample from the trained checkpoint
 ```
 
-A 2.04M-parameter GPT trained this way for 12h on a 10-core M4 (CPU only) reaches a validation loss of **3.20**, down from the 6.93 uniform-prior baseline:
+On the GPU (needs Deno), the whole training step stays in GPU memory, ~50× faster than the CPU pool, which unlocks an order-of-magnitude larger model:
+
+```bash
+LAYERS=6 HEADS=6 EMBD=384 BLOCK=256 BATCH=32 STEPS=12000 \
+  OUT=gpt-big.bin pnpm gpu-pretrain-loop   # auto-resuming supervised run
+pnpm generate --ckpt checkpoints/gpt-big.bin --prompt "It was a"
+```
+
+A 2.04M-parameter GPT trained on CPU for 12h on a 10-core M4 reaches a validation loss of **3.20**, down from the 6.93 uniform-prior baseline:
 
 > It was a bright girl.
 >
 > “Why’s the barricade of your soul?” said Mr. Guppy; “but all him to-day, I have always been given; and they are silent, that they were very simply unable to get away on.”
 
 Fluent English morphology, dialogue convention, and Victorian register — with the incoherent semantics you'd expect at 2M parameters. See [docs/TRAINING.md](./docs/TRAINING.md) for the full run and how the model is sized against the compute budget.
+
+## Talk to it
+
+The pretrained model can be instruction-tuned into a small chatbot:
+
+```bash
+pnpm prepare-chat     # synthetic chat dataset
+pnpm finetune-chat    # instruction-tune on the GPU (~20 min)
+pnpm chat             # interactive conversation in the terminal
+pnpm serve            # or: browser chat UI at http://localhost:8787
+```
+
+A genuine chatbot in mechanism (two-stage training, turn-taking, chat template) and a limited one in ability — good at greetings, questions about itself, and small talk; incoherent beyond that. See [docs/CHAT.md](./docs/CHAT.md) for the honest scope.
 
 ## Use it as a library
 
@@ -54,7 +75,7 @@ console.log(model.weight.data[0], model.bias!.data[0]); // ≈ 2, ≈ 1
 | Directory       | Subsystem                                                            | Status |
 | --------------- | -------------------------------------------------------------------- | ------ |
 | `src/math`      | Tensors, broadcasting, reverse-mode autodiff, seeded RNG             | ✅ working core |
-| `src/nn`        | Module system, Linear, activations, LayerNorm, losses                | ✅ working core |
+| `src/nn`        | Module system, Linear, activations, LayerNorm, RMSNorm, losses       | ✅ working core |
 | `src/models`    | GPT (CPU) + **GpuGPT** (GPU-resident training, 52× CPU)              | ✅ working core |
 | `src/optim`     | SGD(+momentum), Adam/AdamW, RMSProp, LR schedulers, grad clipping    | ✅ working core |
 | `src/tokenizer` | Byte-level BPE (train/encode/decode/serialize)                       | ✅ working core |

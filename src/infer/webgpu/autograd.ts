@@ -199,6 +199,28 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x; if(i>=p.n){retu
   gIn[i] = gIn[i] + gOut[i]*(0.5*(1.0+t)+0.5*v*(1.0-t*t)*dinner); }
 `;
 
+/** SiLU / swish (x * sigmoid(x)) forward and backward — the SwiGLU gate. */
+const SILU = /* wgsl */ `
+struct P { n:u32,_a:u32,_b:u32,_c:u32 };
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+@group(0) @binding(2) var<uniform> p: P;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x; if(i>=p.n){return;}
+  let v = x[i]; out[i] = v/(1.0+exp(-v)); }
+`;
+const SILU_BWD = /* wgsl */ `
+struct P { n:u32,_a:u32,_b:u32,_c:u32 };
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> gOut: array<f32>;
+@group(0) @binding(2) var<storage, read_write> gIn: array<f32>;
+@group(0) @binding(3) var<uniform> p: P;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x; if(i>=p.n){return;}
+  let v = x[i]; let s = 1.0/(1.0+exp(-v)); let y = v*s;
+  gIn[i] = gIn[i] + gOut[i]*(s + y*(1.0-s)); }
+`;
+
 /** Softmax over the last dimension (one thread per row). */
 const SOFTMAX = /* wgsl */ `
 struct P { rows:u32, d:u32,_a:u32,_b:u32 };
@@ -282,6 +304,111 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>){ let j=g.x; if(j>=p.d){retu
   var dg=0.0; var db=0.0;
   for(var r=0u;r<p.rows;r=r+1u){ let off=r*p.d; let xh=(x[off+j]-mean[r])*rstd[r]; dg=dg+gOut[off+j]*xh; db=db+gOut[off+j]; }
   dgamma[j]=dgamma[j]+dg; dbeta[j]=dbeta[j]+db;
+}
+`;
+
+/**
+ * RMSNorm over the last dim. Like LN_FWD but with no centering and no beta, so
+ * it saves a reduction here and a whole parameter vector in the model.
+ * Forward writes out plus the per-row reciprocal RMS, which backward reuses.
+ */
+const RMS_FWD = /* wgsl */ `
+struct P { rows:u32, d:u32, eps:f32,_b:u32 };
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> gamma: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<storage, read_write> rstd: array<f32>;
+@group(0) @binding(4) var<uniform> p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) g: vec3<u32>){ let r=g.x; if(r>=p.rows){return;}
+  let off=r*p.d; let nf=f32(p.d);
+  var ms=0.0; for(var j=0u;j<p.d;j=j+1u){ let v=x[off+j]; ms=ms+v*v; } ms=ms/nf;
+  let rs = 1.0/sqrt(ms+p.eps);
+  rstd[r]=rs;
+  for(var j=0u;j<p.d;j=j+1u){ out[off+j]=x[off+j]*rs*gamma[j]; }
+}
+`;
+// y_j = x_j * rs * g_j with rs = (mean(x^2)+eps)^-1/2, so
+//   drs/dx_j = -rs^3 * x_j / d
+//   dx_j = rs*g_j*dy_j - (rs^3 * x_j / d) * sum_k dy_k*g_k*x_k
+const RMS_DX = /* wgsl */ `
+struct P { rows:u32, d:u32, eps:f32,_b:u32 };
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> gOut: array<f32>;
+@group(0) @binding(2) var<storage, read> gamma: array<f32>;
+@group(0) @binding(3) var<storage, read> rstd: array<f32>;
+@group(0) @binding(4) var<storage, read_write> gIn: array<f32>;
+@group(0) @binding(5) var<uniform> p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) g: vec3<u32>){ let r=g.x; if(r>=p.rows){return;}
+  let off=r*p.d; let nf=f32(p.d); let rs=rstd[r];
+  var s=0.0;
+  for(var j=0u;j<p.d;j=j+1u){ s = s + gOut[off+j]*gamma[j]*x[off+j]; }
+  let k = rs*rs*rs*s/nf;
+  for(var j=0u;j<p.d;j=j+1u){
+    gIn[off+j] = gIn[off+j] + rs*gOut[off+j]*gamma[j] - k*x[off+j]; }
+}
+`;
+const RMS_DG = /* wgsl */ `
+struct P { rows:u32, d:u32,_a:u32,_b:u32 };
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> gOut: array<f32>;
+@group(0) @binding(2) var<storage, read> rstd: array<f32>;
+@group(0) @binding(3) var<storage, read_write> dgamma: array<f32>;
+@group(0) @binding(4) var<uniform> p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) g: vec3<u32>){ let j=g.x; if(j>=p.d){return;}
+  var dg=0.0;
+  for(var r=0u;r<p.rows;r=r+1u){ let off=r*p.d; dg = dg + gOut[off+j]*x[off+j]*rstd[r]; }
+  dgamma[j]=dgamma[j]+dg;
+}
+`;
+
+/**
+ * Rotary position embedding over [groups, time, headDim]: rotates each adjacent
+ * dimension pair by an angle set by its position. One thread per pair. The
+ * angles are recomputed from the index rather than read from a table — cheaper
+ * than a buffer round trip, and it keeps the op stateless.
+ */
+const ROPE = /* wgsl */ `
+struct P { groups:u32, t:u32, hd:u32, base:f32 };
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+@group(0) @binding(2) var<uniform> p: P;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) g: vec3<u32>){
+  let halfd = p.hd/2u;
+  let i = g.x; if(i >= p.groups*p.t*halfd){return;}
+  let pair = i % halfd;
+  let pos = (i/halfd) % p.t;
+  let grp = i/(halfd*p.t);
+  let off = (grp*p.t + pos)*p.hd + pair*2u;
+  let theta = f32(pos) / pow(p.base, f32(2u*pair)/f32(p.hd));
+  let c = cos(theta); let s = sin(theta);
+  let x0 = x[off]; let x1 = x[off+1u];
+  out[off] = x0*c - x1*s;
+  out[off+1u] = x0*s + x1*c;
+}
+`;
+// Rotation is orthogonal, so the vector-Jacobian product is the inverse rotation.
+const ROPE_BWD = /* wgsl */ `
+struct P { groups:u32, t:u32, hd:u32, base:f32 };
+@group(0) @binding(0) var<storage, read> gOut: array<f32>;
+@group(0) @binding(1) var<storage, read_write> gIn: array<f32>;
+@group(0) @binding(2) var<uniform> p: P;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) g: vec3<u32>){
+  let halfd = p.hd/2u;
+  let i = g.x; if(i >= p.groups*p.t*halfd){return;}
+  let pair = i % halfd;
+  let pos = (i/halfd) % p.t;
+  let grp = i/(halfd*p.t);
+  let off = (grp*p.t + pos)*p.hd + pair*2u;
+  let theta = f32(pos) / pow(p.base, f32(2u*pair)/f32(p.hd));
+  let c = cos(theta); let s = sin(theta);
+  let g0 = gOut[off]; let g1 = gOut[off+1u];
+  gIn[off] = gIn[off] + g0*c + g1*s;
+  gIn[off+1u] = gIn[off+1u] - g0*s + g1*c;
 }
 `;
 
@@ -422,7 +549,19 @@ export class GpuEngine {
       if (!nav?.gpu) throw new Error("No WebGPU device available");
       const adapter = await nav.gpu.requestAdapter();
       if (!adapter) throw new Error("No WebGPU adapter available");
-      dev = await adapter.requestDevice();
+      // Request the adapter's full limits. The default device grants only the
+      // WebGPU baseline (128MB storage binding / 256MB buffer), which caps the
+      // model size well below what the hardware allows; on Apple Silicon and
+      // cloud NVIDIA these are gigabytes. Bump the four limits that gate GPT
+      // scale: big weight matrices, the [N, vocab] logits, and the AdamW state.
+      const al = adapter.limits;
+      const requiredLimits: Record<string, number> = {
+        maxBufferSize: al.maxBufferSize,
+        maxStorageBufferBindingSize: al.maxStorageBufferBindingSize,
+        maxComputeWorkgroupsPerDimension: al.maxComputeWorkgroupsPerDimension,
+        maxComputeInvocationsPerWorkgroup: al.maxComputeInvocationsPerWorkgroup,
+      };
+      dev = await adapter.requestDevice({ requiredLimits });
     }
     return new GpuEngine(dev);
   }
@@ -514,6 +653,32 @@ export class GpuEngine {
   }
   geluBwd(x: GPUBuffer, gOut: GPUBuffer, gIn: GPUBuffer, n: number): void {
     this.run(GELU_BWD, [x, gOut, gIn], new Uint32Array([n, 0, 0, 0]), wg(n));
+  }
+  siluInto(x: GPUBuffer, out: GPUBuffer, n: number): void {
+    this.run(SILU, [x, out], new Uint32Array([n, 0, 0, 0]), wg(n));
+  }
+  siluBwd(x: GPUBuffer, gOut: GPUBuffer, gIn: GPUBuffer, n: number): void {
+    this.run(SILU_BWD, [x, gOut, gIn], new Uint32Array([n, 0, 0, 0]), wg(n));
+  }
+  rmsFwd(x: GPUBuffer, gamma: GPUBuffer, out: GPUBuffer, rstd: GPUBuffer, rows: number, d: number, eps: number): void {
+    const u = new ArrayBuffer(16); new Uint32Array(u, 0, 2).set([rows, d]); new Float32Array(u, 8, 1)[0] = eps;
+    this.run(RMS_FWD, [x, gamma, out, rstd], new Uint8Array(u), Math.ceil(rows / 64));
+  }
+  rmsDx(x: GPUBuffer, gOut: GPUBuffer, gamma: GPUBuffer, rstd: GPUBuffer, gIn: GPUBuffer, rows: number, d: number, eps: number): void {
+    const u = new ArrayBuffer(16); new Uint32Array(u, 0, 2).set([rows, d]); new Float32Array(u, 8, 1)[0] = eps;
+    this.run(RMS_DX, [x, gOut, gamma, rstd, gIn], new Uint8Array(u), Math.ceil(rows / 64));
+  }
+  rmsDg(x: GPUBuffer, gOut: GPUBuffer, rstd: GPUBuffer, dgamma: GPUBuffer, rows: number, d: number): void {
+    const u = new ArrayBuffer(16); new Uint32Array(u, 0, 2).set([rows, d]);
+    this.run(RMS_DG, [x, gOut, rstd, dgamma], new Uint8Array(u), Math.ceil(d / 64));
+  }
+  ropeInto(x: GPUBuffer, out: GPUBuffer, groups: number, t: number, hd: number, base: number): void {
+    const u = new ArrayBuffer(16); new Uint32Array(u, 0, 3).set([groups, t, hd]); new Float32Array(u, 12, 1)[0] = base;
+    this.run(ROPE, [x, out], new Uint8Array(u), wg(groups * t * (hd / 2)));
+  }
+  ropeBwd(gOut: GPUBuffer, gIn: GPUBuffer, groups: number, t: number, hd: number, base: number): void {
+    const u = new ArrayBuffer(16); new Uint32Array(u, 0, 3).set([groups, t, hd]); new Float32Array(u, 12, 1)[0] = base;
+    this.run(ROPE_BWD, [gOut, gIn], new Uint8Array(u), wg(groups * t * (hd / 2)));
   }
   softmaxInto(x: GPUBuffer, out: GPUBuffer, rows: number, d: number): void {
     this.run(SOFTMAX, [x, out], new Uint32Array([rows, d, 0, 0]), Math.ceil(rows / 64));
@@ -649,11 +814,18 @@ export class GpuTensor {
       if (b.requiresGrad) {
         const sign = op === 1 ? -1 : 1;
         if (op === 2) {
-          // dB += segsum(gC * a)
-          const tmp = e.buffer(n);
-          e.ewise(gC, a.buffer, tmp, n, n, 2, false);
-          e.segsum(tmp, b.ensureGrad(), n, bLen, 1, true);
-          tmp.destroy();
+          if (bLen === n) {
+            // Same-shape mul (SwiGLU's gate): no broadcast, so every segment has
+            // exactly one element — write dB += gC * a straight through instead
+            // of paying a temp buffer and a degenerate segsum.
+            e.ewise(gC, a.buffer, b.ensureGrad(), n, n, 2, true);
+          } else {
+            // dB += segsum(gC * a)
+            const tmp = e.buffer(n);
+            e.ewise(gC, a.buffer, tmp, n, n, 2, false);
+            e.segsum(tmp, b.ensureGrad(), n, bLen, 1, true);
+            tmp.destroy();
+          }
         } else {
           e.segsum(gC, b.ensureGrad(), n, bLen, sign, true);
         }
@@ -778,6 +950,51 @@ export class GpuTensor {
     const a = this;
     const t = this.out(outBuf, [...this.shape], [a], () => {
       if (a.requiresGrad) e.geluBwd(a.buffer, t.grad!, a.ensureGrad(), n);
+    });
+    return t;
+  }
+
+  /** SiLU / swish: x * sigmoid(x). */
+  silu(): GpuTensor {
+    const e = this.engine;
+    const n = this.size;
+    const outBuf = e.buffer(n);
+    e.siluInto(this.buffer, outBuf, n);
+    const a = this;
+    const t = this.out(outBuf, [...this.shape], [a], () => {
+      if (a.requiresGrad) e.siluBwd(a.buffer, t.grad!, a.ensureGrad(), n);
+    });
+    return t;
+  }
+
+  /** RMSNorm over the last dimension with a learnable gain (no bias). */
+  rmsNorm(gamma: GpuTensor, eps = 1e-5): GpuTensor {
+    const e = this.engine;
+    const d = this.shape[this.ndim - 1];
+    const rows = this.size / d;
+    const outBuf = e.buffer(this.size);
+    const rstd = e.buffer(rows);
+    e.rmsFwd(this.buffer, gamma.buffer, outBuf, rstd, rows, d, eps);
+    const a = this;
+    const t = this.out(outBuf, [...this.shape], [a, gamma], () => {
+      const gC = t.grad!;
+      if (a.requiresGrad) e.rmsDx(a.buffer, gC, gamma.buffer, rstd, a.ensureGrad(), rows, d, eps);
+      if (gamma.requiresGrad) e.rmsDg(a.buffer, gC, rstd, gamma.ensureGrad(), rows, d);
+    });
+    return t;
+  }
+
+  /** Rotary position embedding over a [groups, time, headDim] tensor. */
+  rope(base = 10000): GpuTensor {
+    if (this.ndim !== 3) throw new Error(`rope expects a [groups, time, headDim] tensor, got ${this.ndim}-D`);
+    const [groups, tt, hd] = this.shape;
+    if (hd % 2 !== 0) throw new Error(`rope requires an even headDim, got ${hd}`);
+    const e = this.engine;
+    const outBuf = e.buffer(this.size);
+    e.ropeInto(this.buffer, outBuf, groups, tt, hd, base);
+    const a = this;
+    const t = this.out(outBuf, [...this.shape], [a], () => {
+      if (a.requiresGrad) e.ropeBwd(t.grad!, a.ensureGrad(), groups, tt, hd, base);
     });
     return t;
   }

@@ -7,4 +7,5 @@ coverage/
 .DS_Store
 checkpoints/
 data/
+data-big/
 train.log

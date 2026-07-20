@@ -1,17 +1,31 @@
 /**
- * GPT — a decoder-only transformer in the GPT-2 / nanoGPT shape, built
- * entirely on Turt's tensor engine. Every layer composes primitive
- * differentiable ops, so autodiff supplies the whole backward pass.
+ * GPT — a decoder-only transformer built entirely on Turt's tensor engine.
+ * Every layer composes primitive differentiable ops, so autodiff supplies the
+ * whole backward pass.
  *
- * Architecture (pre-LayerNorm, as in GPT-2):
+ * Two architectures share this file, selected by `GPTConfig.arch`:
  *
- *   idx -> token embedding + learned positional embedding
- *       -> nLayer x [ x + attn(ln1(x)) ; x + mlp(ln2(x)) ]
- *       -> final LayerNorm
+ *   "gpt2"   — the original 2019 shape (nanoGPT's): LayerNorm, GELU MLP,
+ *              a learned position table, biases on every projection.
+ *   "modern" — the shape every strong small model converged on (Llama,
+ *              TinyLlama, Qwen): RMSNorm, SwiGLU, RoPE, no biases.
+ *
+ * Both are pre-norm with a weight-tied head:
+ *
+ *   idx -> token embedding (+ learned positional embedding, "gpt2" only)
+ *       -> nLayer x [ x + attn(norm(x)) ; x + mlp(norm(x)) ]
+ *       -> final norm
  *       -> lm_head (weights tied to the token embedding)
  *
- * Dropout is omitted: at the scale that is trainable on CPU the model is
- * heavily data-bound rather than overfitting, and skipping it buys compute.
+ * "modern" is the default because it measures better: on this corpus at a matched
+ * 5.3M params it ends 0.33 nats below "gpt2", reaching "gpt2"'s 400-step loss by
+ * step 200 (numbers and method in docs/TRAINING.md). It costs ~3% throughput —
+ * dropping the biases removes six kernel dispatches per block, but RoPE and
+ * SwiGLU's third matmul spend that back. Since the engine is dispatch-bound
+ * rather than FLOP-bound (docs/SCALING.md), that 3% is op count, not arithmetic.
+ *
+ * Dropout is omitted: at the scale trainable here the model is heavily
+ * data-bound rather than overfitting, and skipping it buys compute.
  */
 
 import { Tensor } from "../math/tensor.js";
@@ -19,6 +33,9 @@ import { type Rng, defaultRng } from "../math/random.js";
 import { Module } from "../nn/module.js";
 import { Linear } from "../nn/linear.js";
 import { LayerNorm } from "../nn/layernorm.js";
+import { RMSNorm } from "../nn/rmsnorm.js";
+
+export type Arch = "gpt2" | "modern";
 
 export interface GPTConfig {
   vocabSize: number;
@@ -26,12 +43,38 @@ export interface GPTConfig {
   nLayer: number;
   nHead: number;
   nEmbd: number;
+  /**
+   * Defaults to "gpt2" when absent, so checkpoints written before this field
+   * existed keep loading with the architecture they were trained as.
+   */
+  arch?: Arch;
 }
+
+/** A norm layer; both variants take a [.., nEmbd] tensor and return the same shape. */
+type Norm = LayerNorm | RMSNorm;
 
 /** GPT-2 initializes most weights from N(0, 0.02). */
 const INIT_STD = 0.02;
 
-/** Multi-head causal self-attention over an [batch, time, channels] input. */
+export const archOf = (config: GPTConfig): Arch => config.arch ?? "gpt2";
+
+/**
+ * Hidden width of the feed-forward block.
+ *
+ * GELU's MLP is two matrices of 4*nEmbd. SwiGLU needs three (gate, up, down),
+ * so 8/3 * nEmbd keeps the parameter count identical to the GELU block rather
+ * than quietly inflating the model by 50%. Rounded to a multiple of 64 to keep
+ * the matmul tiles aligned.
+ */
+export function mlpHidden(config: GPTConfig): number {
+  if (archOf(config) === "gpt2") return 4 * config.nEmbd;
+  return Math.max(64, Math.round((8 * config.nEmbd) / 3 / 64) * 64);
+}
+
+const makeNorm = (config: GPTConfig, dim: number): Norm =>
+  archOf(config) === "modern" ? new RMSNorm(dim) : new LayerNorm(dim);
+
+/** Multi-head causal self-attention over a [batch, time, channels] input. */
 class CausalSelfAttention extends Module {
   private readonly q: Linear;
   private readonly k: Linear;
@@ -39,6 +82,7 @@ class CausalSelfAttention extends Module {
   private readonly proj: Linear;
   private readonly nHead: number;
   private readonly headDim: number;
+  private readonly useRope: boolean;
 
   constructor(config: GPTConfig, rng: Rng) {
     super();
@@ -48,12 +92,14 @@ class CausalSelfAttention extends Module {
     }
     this.nHead = nHead;
     this.headDim = nEmbd / nHead;
-    this.q = new Linear(nEmbd, nEmbd, { rng, std: INIT_STD });
-    this.k = new Linear(nEmbd, nEmbd, { rng, std: INIT_STD });
-    this.v = new Linear(nEmbd, nEmbd, { rng, std: INIT_STD });
+    this.useRope = archOf(config) === "modern";
+    const bias = archOf(config) === "gpt2";
+    this.q = new Linear(nEmbd, nEmbd, { rng, std: INIT_STD, bias });
+    this.k = new Linear(nEmbd, nEmbd, { rng, std: INIT_STD, bias });
+    this.v = new Linear(nEmbd, nEmbd, { rng, std: INIT_STD, bias });
     // Residual projections are down-scaled so the residual stream variance
     // stays ~constant with depth (GPT-2's 1/sqrt(2 * nLayer) rule).
-    this.proj = new Linear(nEmbd, nEmbd, { rng, std: INIT_STD / Math.sqrt(2 * nLayer) });
+    this.proj = new Linear(nEmbd, nEmbd, { rng, std: INIT_STD / Math.sqrt(2 * nLayer), bias });
   }
 
   /** Splits [b*t, c] into per-head [b*h, t, headDim]. */
@@ -68,9 +114,16 @@ class CausalSelfAttention extends Module {
     const [b, t, c] = x.shape;
     const flat = x.reshape([b * t, c]);
 
-    const q = this.splitHeads(this.q.forward(flat), b, t);
-    const k = this.splitHeads(this.k.forward(flat), b, t);
+    let q = this.splitHeads(this.q.forward(flat), b, t);
+    let k = this.splitHeads(this.k.forward(flat), b, t);
     const v = this.splitHeads(this.v.forward(flat), b, t);
+
+    // Position enters here rather than at the embedding: rotating q and k makes
+    // their dot product a function of relative distance.
+    if (this.useRope) {
+      q = q.rope();
+      k = k.rope();
+    }
 
     // Scaled dot-product attention with a causal mask.
     const scores = q
@@ -89,16 +142,17 @@ class CausalSelfAttention extends Module {
   }
 }
 
-/** Position-wise feed-forward network: c -> 4c -> GELU -> c. */
-class MLP extends Module {
+/** GPT-2's position-wise feed-forward network: c -> 4c -> GELU -> c. */
+class GeluMLP extends Module {
   private readonly fc: Linear;
   private readonly proj: Linear;
 
   constructor(config: GPTConfig, rng: Rng) {
     super();
     const { nEmbd, nLayer } = config;
-    this.fc = new Linear(nEmbd, 4 * nEmbd, { rng, std: INIT_STD });
-    this.proj = new Linear(4 * nEmbd, nEmbd, { rng, std: INIT_STD / Math.sqrt(2 * nLayer) });
+    const hidden = mlpHidden(config);
+    this.fc = new Linear(nEmbd, hidden, { rng, std: INIT_STD });
+    this.proj = new Linear(hidden, nEmbd, { rng, std: INIT_STD / Math.sqrt(2 * nLayer) });
   }
 
   forward(x: Tensor): Tensor {
@@ -109,19 +163,48 @@ class MLP extends Module {
   }
 }
 
-/** Transformer block: attention and MLP, each with a pre-norm and a residual. */
-class Block extends Module {
-  private readonly ln1: LayerNorm;
-  private readonly attn: CausalSelfAttention;
-  private readonly ln2: LayerNorm;
-  private readonly mlp: MLP;
+/**
+ * SwiGLU feed-forward (Shazeer, 2020): down(silu(gate(x)) * up(x)).
+ *
+ * The multiplicative gate lets each channel suppress or pass its partner, which
+ * a single GELU projection cannot express. It buys a consistent loss improvement
+ * over GELU at matched parameters — one of the few free lunches in this shape.
+ */
+class SwiGLU extends Module {
+  private readonly gate: Linear;
+  private readonly up: Linear;
+  private readonly down: Linear;
 
   constructor(config: GPTConfig, rng: Rng) {
     super();
-    this.ln1 = new LayerNorm(config.nEmbd);
+    const { nEmbd, nLayer } = config;
+    const hidden = mlpHidden(config);
+    this.gate = new Linear(nEmbd, hidden, { rng, std: INIT_STD, bias: false });
+    this.up = new Linear(nEmbd, hidden, { rng, std: INIT_STD, bias: false });
+    this.down = new Linear(hidden, nEmbd, { rng, std: INIT_STD / Math.sqrt(2 * nLayer), bias: false });
+  }
+
+  forward(x: Tensor): Tensor {
+    const [b, t, c] = x.shape;
+    const flat = x.reshape([b * t, c]);
+    const hidden = this.gate.forward(flat).silu().mul(this.up.forward(flat));
+    return this.down.forward(hidden).reshape([b, t, c]);
+  }
+}
+
+/** Transformer block: attention and MLP, each with a pre-norm and a residual. */
+class Block extends Module {
+  private readonly ln1: Norm;
+  private readonly attn: CausalSelfAttention;
+  private readonly ln2: Norm;
+  private readonly mlp: GeluMLP | SwiGLU;
+
+  constructor(config: GPTConfig, rng: Rng) {
+    super();
+    this.ln1 = makeNorm(config, config.nEmbd);
     this.attn = new CausalSelfAttention(config, rng);
-    this.ln2 = new LayerNorm(config.nEmbd);
-    this.mlp = new MLP(config, rng);
+    this.ln2 = makeNorm(config, config.nEmbd);
+    this.mlp = archOf(config) === "modern" ? new SwiGLU(config, rng) : new GeluMLP(config, rng);
   }
 
   forward(x: Tensor): Tensor {
@@ -134,10 +217,10 @@ export class GPT extends Module {
   readonly config: GPTConfig;
   /** Token embedding table [vocabSize, nEmbd]; also serves as the tied output head. */
   private readonly wte: Tensor;
-  /** Learned positional embedding table [blockSize, nEmbd]. */
-  private readonly wpe: Tensor;
+  /** Learned positional embedding table [blockSize, nEmbd]. Null under RoPE. */
+  private readonly wpe: Tensor | null;
   private readonly blocks: Block[];
-  private readonly lnf: LayerNorm;
+  private readonly lnf: Norm;
 
   constructor(config: GPTConfig, rng: Rng = defaultRng) {
     super();
@@ -147,13 +230,12 @@ export class GPT extends Module {
       rng,
       std: INIT_STD,
     });
-    this.wpe = Tensor.randn([config.blockSize, config.nEmbd], {
-      requiresGrad: true,
-      rng,
-      std: INIT_STD,
-    });
+    this.wpe =
+      archOf(config) === "modern"
+        ? null
+        : Tensor.randn([config.blockSize, config.nEmbd], { requiresGrad: true, rng, std: INIT_STD });
     this.blocks = Array.from({ length: config.nLayer }, () => new Block(config, rng));
-    this.lnf = new LayerNorm(config.nEmbd);
+    this.lnf = makeNorm(config, config.nEmbd);
   }
 
   /** Total trainable scalar count. */
@@ -176,20 +258,23 @@ export class GPT extends Module {
 
     const tokenIds = new Int32Array(b * t);
     for (let i = 0; i < b * t; i++) tokenIds[i] = idx.data[i];
-    // Positions repeat 0..t-1 for every sequence in the batch.
-    const posIds = new Int32Array(b * t);
-    for (let i = 0; i < b * t; i++) posIds[i] = i % t;
 
     const tokenEmb = this.wte.gatherRows(tokenIds);
-    const posEmb = this.wpe.gatherRows(posIds);
+    let x = tokenEmb;
+    if (this.wpe) {
+      // Positions repeat 0..t-1 for every sequence in the batch.
+      const posIds = new Int32Array(b * t);
+      for (let i = 0; i < b * t; i++) posIds[i] = i % t;
+      x = x.add(this.wpe.gatherRows(posIds));
+    }
 
-    let x = tokenEmb.add(posEmb).reshape([b, t, nEmbd]);
-    for (const block of this.blocks) x = block.forward(x);
-    x = this.lnf.forward(x).reshape([b * t, nEmbd]);
+    let h = x.reshape([b, t, nEmbd]);
+    for (const block of this.blocks) h = block.forward(h);
+    const out = this.lnf.forward(h).reshape([b * t, nEmbd]);
 
     // Output head shares weights with the token embedding (GPT-2 weight tying);
     // gradients from both uses accumulate into `wte`.
-    return x.matmul(this.wte.transpose());
+    return out.matmul(this.wte.transpose());
   }
 
   /** Cross-entropy of the model's predictions against the next-token targets. */
@@ -200,13 +285,15 @@ export class GPT extends Module {
   /**
    * Autoregressively samples `maxNewTokens` continuations of `prompt`.
    * The context is cropped to the last `blockSize` tokens each step.
+   * `onToken` is called with each sampled id; returning `false` stops
+   * generation early (e.g. when a stop sequence appears in the decoded text).
    */
   generate(
     prompt: number[],
     maxNewTokens: number,
-    opts: { temperature?: number; topK?: number; rng?: Rng } = {},
+    opts: { temperature?: number; topK?: number; rng?: Rng; onToken?: (id: number) => boolean | void } = {},
   ): number[] {
-    const { temperature = 1.0, topK, rng = defaultRng } = opts;
+    const { temperature = 1.0, topK, rng = defaultRng, onToken } = opts;
     const { blockSize, vocabSize } = this.config;
     const ids = [...prompt];
 
@@ -226,7 +313,9 @@ export class GPT extends Module {
         for (let j = 0; j < vocabSize; j++) if (last[j] < threshold) last[j] = -Infinity;
       }
 
-      ids.push(sampleFromLogits(last, rng));
+      const next = sampleFromLogits(last, rng);
+      ids.push(next);
+      if (onToken && onToken(next) === false) break;
     }
     return ids;
   }

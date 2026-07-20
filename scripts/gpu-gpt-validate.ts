@@ -10,7 +10,7 @@
  * AdamW) at a realistic size and reports tokens/sec vs the CPU model.
  */
 
-import { GPT, type GPTConfig } from "../src/models/gpt.ts";
+import { GPT, type Arch, type GPTConfig } from "../src/models/gpt.ts";
 import { GpuGPT } from "../src/models/gpu-gpt.ts";
 import { Tensor } from "../src/math/tensor.ts";
 import { mulberry32 } from "../src/math/random.ts";
@@ -34,9 +34,24 @@ function loadWeights(engine: GpuEngine, cpu: Tensor[], gpu: GpuTensor[]): void {
   }
 }
 
-async function validate(engine: GpuEngine): Promise<boolean> {
-  console.log("Validation — GPU GPT vs CPU GPT (identical weights):\n");
-  const config: GPTConfig = { vocabSize: 48, blockSize: 16, nLayer: 2, nHead: 2, nEmbd: 32 };
+/** Parameter names in `parameters()` order, so a mismatch names the tensor. */
+function paramNames(config: GPTConfig): string[] {
+  const modern = (config.arch ?? "gpt2") === "modern";
+  const names = ["wte"];
+  if (!modern) names.push("wpe");
+  const perBlock = modern
+    ? ["ln1g", "qW", "kW", "vW", "projW", "ln2g", "gateW", "upW", "downW"]
+    : ["ln1g", "ln1b", "qW", "qb", "kW", "kb", "vW", "vb", "projW", "projb",
+       "ln2g", "ln2b", "fcW", "fcb", "mpW", "mpb"];
+  for (let L = 0; L < config.nLayer; L++) names.push(...perBlock.map((s) => `blk${L}.${s}`));
+  names.push("lnfg");
+  if (!modern) names.push("lnfb");
+  return names;
+}
+
+async function validate(engine: GpuEngine, arch: Arch): Promise<boolean> {
+  console.log(`Validation — GPU GPT vs CPU GPT, arch "${arch}" (identical weights):\n`);
+  const config: GPTConfig = { vocabSize: 48, blockSize: 16, nLayer: 2, nHead: 2, nEmbd: 32, arch };
   const b = 2, t = 8;
 
   const cpuModel = new GPT(config, mulberry32(7));
@@ -59,11 +74,7 @@ async function validate(engine: GpuEngine): Promise<boolean> {
   const gpuP = gpuModel.parameters();
   let worst = lossErr;
   let worstName = "loss";
-  const names = ["wte", "wpe"];
-  for (let L = 0; L < config.nLayer; L++) {
-    names.push(...["ln1g", "ln1b", "qW", "qb", "kW", "kb", "vW", "vb", "projW", "projb", "ln2g", "ln2b", "fcW", "fcb", "mpW", "mpb"].map((s) => `blk${L}.${s}`));
-  }
-  names.push("lnfg", "lnfb");
+  const names = paramNames(config);
   for (let i = 0; i < cpuP.length; i++) {
     if (!cpuP[i].grad || !gpuP[i].grad) {
       console.log(`  FAIL ${names[i]} missing grad`);
@@ -79,15 +90,14 @@ async function validate(engine: GpuEngine): Promise<boolean> {
   return ok;
 }
 
-async function benchmark(engine: GpuEngine): Promise<void> {
-  console.log("Benchmark — full resident training step (forward+backward+AdamW):\n");
-  const config: GPTConfig = { vocabSize: 1024, blockSize: 128, nLayer: 6, nHead: 4, nEmbd: 160 };
+async function benchmark(engine: GpuEngine, arch: Arch, withCpuReference: boolean): Promise<number> {
+  const config: GPTConfig = { vocabSize: 1024, blockSize: 128, nLayer: 6, nHead: 4, nEmbd: 160, arch };
   const b = 16, t = config.blockSize;
   const tokensPerStep = b * t;
 
   const model = new GpuGPT(engine, config);
   const params = model.parameters();
-  console.log(`  model: ${(model.numParams() / 1e6).toFixed(2)}M params, batch ${b} x ${t} = ${tokensPerStep} tokens/step\n`);
+  console.log(`  arch "${arch}": ${(model.numParams() / 1e6).toFixed(2)}M params, batch ${b} x ${t} = ${tokensPerStep} tokens/step`);
 
   // AdamW state, resident.
   const mBuf = params.map((p) => engine.buffer(p.size));
@@ -120,26 +130,37 @@ async function benchmark(engine: GpuEngine): Promise<void> {
   for (let i = 0; i < REPS; i++) last = await doStep();
   const secs = (performance.now() - start) / 1000;
   const tokPerSec = (REPS * tokensPerStep) / secs;
-  console.log(`  GPU: ${tokPerSec.toFixed(0)} tok/s  (${(secs / REPS).toFixed(2)}s/step, last loss ${last.toFixed(3)})`);
+  console.log(`    GPU: ${tokPerSec.toFixed(0)} tok/s  (${(secs / REPS).toFixed(2)}s/step, last loss ${last.toFixed(3)})`);
 
-  // CPU single-thread reference on the same config (one step; it is slow).
-  const cpu = new GPT(config, mulberry32(1));
-  const [tok, tgt] = makeBatch();
-  const idx = new Tensor(Float32Array.from(tok), [b, t]);
-  const cstart = performance.now();
-  const cl = cpu.loss(idx, Array.from(tgt));
-  cl.backward();
-  const csecs = (performance.now() - cstart) / 1000;
-  const cpuTokPerSec = tokensPerStep / csecs;
-  console.log(`  CPU: ${cpuTokPerSec.toFixed(0)} tok/s  (${csecs.toFixed(2)}s/step, single-thread)`);
-  console.log(`\n  Resident GPU training is ${(tokPerSec / cpuTokPerSec).toFixed(1)}x the single-thread CPU trainer.`);
+  if (withCpuReference) {
+    // CPU single-thread reference on the same config (one step; it is slow).
+    const cpu = new GPT(config, mulberry32(1));
+    const [tok, tgt] = makeBatch();
+    const idx = new Tensor(Float32Array.from(tok), [b, t]);
+    const cstart = performance.now();
+    const cl = cpu.loss(idx, Array.from(tgt));
+    cl.backward();
+    const csecs = (performance.now() - cstart) / 1000;
+    const cpuTokPerSec = tokensPerStep / csecs;
+    console.log(`    CPU: ${cpuTokPerSec.toFixed(0)} tok/s  (${csecs.toFixed(2)}s/step, single-thread)`);
+    console.log(`    Resident GPU training is ${(tokPerSec / cpuTokPerSec).toFixed(1)}x the single-thread CPU trainer.`);
+  }
+  return tokPerSec;
 }
 
 async function main(): Promise<void> {
   const engine = await GpuEngine.create();
-  const ok = await validate(engine);
-  if (!ok) Deno.exit(1);
-  await benchmark(engine);
+  for (const arch of ["gpt2", "modern"] as Arch[]) {
+    if (!(await validate(engine, arch))) Deno.exit(1);
+  }
+
+  console.log("Benchmark — full resident training step (forward+backward+AdamW):\n");
+  const legacy = await benchmark(engine, "gpt2", true);
+  console.log();
+  const modern = await benchmark(engine, "modern", false);
+  // This engine is dispatch-bound, so the modern block's lower op count shows up
+  // directly as throughput at matched parameter count — see docs/SCALING.md.
+  console.log(`\n  "modern" runs at ${(modern / legacy).toFixed(2)}x the "gpt2" throughput at matched params.`);
 }
 
 main().catch((err) => {

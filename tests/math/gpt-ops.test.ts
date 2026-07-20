@@ -175,3 +175,70 @@ describe("crossEntropyLogits", () => {
     for (let i = 0; i < 4; i++) expect(logits.grad![i]).toBeCloseTo(numeric[i], 3);
   });
 });
+
+describe("silu", () => {
+  it("is x * sigmoid(x)", () => {
+    const t = Tensor.fromArray([-2, 0, 1, 3], [4]);
+    const expected = [-2, 0, 1, 3].map((x) => x / (1 + Math.exp(-x)));
+    t.silu().toArray().forEach((v, i) => expect(v).toBeCloseTo(expected[i], 5));
+  });
+
+  it("passes zero through and approaches identity for large x", () => {
+    const out = Tensor.fromArray([0, 20], [2]).silu().toArray();
+    expect(out[0]).toBe(0);
+    expect(out[1]).toBeCloseTo(20, 4);
+  });
+
+  it("matches numeric gradients", () => {
+    checkGrad(randVals(6), [6], (t) => t.silu().sum(), 3);
+  });
+});
+
+describe("rope", () => {
+  it("leaves position 0 unrotated", () => {
+    // theta = 0 at position 0, so the rotation is the identity there.
+    const vals = randVals(4);
+    const out = Tensor.fromArray(vals, [1, 1, 4]).rope().toArray();
+    out.forEach((v, i) => expect(v).toBeCloseTo(vals[i], 5));
+  });
+
+  it("preserves the norm of every position (rotations are orthogonal)", () => {
+    const t = Tensor.fromArray(randVals(2 * 5 * 4), [2, 5, 4]);
+    const out = t.rope().toArray();
+    const inp = t.toArray();
+    for (let p = 0; p < 2 * 5; p++) {
+      const norm = (a: number[]): number => Math.hypot(...a.slice(p * 4, p * 4 + 4));
+      expect(norm(out)).toBeCloseTo(norm(inp), 4);
+    }
+  });
+
+  it("makes the query-key dot product depend only on relative distance", () => {
+    // The whole point of RoPE: give every position the same underlying vector,
+    // and dot(rope[i], rope[j]) must depend on i-j alone, not on i and j.
+    const hd = 4;
+    const t = 6;
+    const vec = randVals(hd);
+    const rotated = Tensor.fromArray(
+      Array.from({ length: t }, () => vec).flat(),
+      [1, t, hd],
+    ).rope().toArray();
+
+    const dot = (i: number, j: number): number => {
+      let s = 0;
+      for (let d = 0; d < hd; d++) s += rotated[i * hd + d] * rotated[j * hd + d];
+      return s;
+    };
+    for (const gap of [0, 1, 2, 3]) {
+      const reference = dot(0, gap);
+      for (let i = 0; i + gap < t; i++) expect(dot(i, i + gap)).toBeCloseTo(reference, 4);
+    }
+  });
+
+  it("matches numeric gradients", () => {
+    checkGrad(randVals(1 * 3 * 4), [1, 3, 4], (t) => t.rope().mul(t.rope()).sum(), 3);
+  });
+
+  it("rejects an odd head dimension", () => {
+    expect(() => Tensor.fromArray(randVals(3), [1, 1, 3]).rope()).toThrow(/even headDim/);
+  });
+});

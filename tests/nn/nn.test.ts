@@ -3,6 +3,7 @@ import {
   Adam,
   LayerNorm,
   Linear,
+  RMSNorm,
   ReLU,
   SGD,
   Sequential,
@@ -75,5 +76,32 @@ describe("Gradient clipping", () => {
     expect(before).toBeGreaterThan(1);
     const norm = Math.hypot(p.grad![0], p.grad![1]);
     expect(norm).toBeCloseTo(1, 4);
+  });
+});
+
+describe("RMSNorm", () => {
+  it("scales each row to unit root-mean-square", () => {
+    const rng = mulberry32(3);
+    const out = new RMSNorm(8).forward(Tensor.randn([4, 8], { rng }));
+    for (let row = 0; row < 4; row++) {
+      const vals = out.toArray().slice(row * 8, (row + 1) * 8);
+      const rms = Math.sqrt(vals.reduce((s, v) => s + v * v, 0) / 8);
+      expect(rms).toBeCloseTo(1, 3);
+    }
+  });
+
+  it("does not center the row, unlike LayerNorm", () => {
+    // Every value positive: LayerNorm would force mean 0, RMSNorm must not.
+    const x = Tensor.fromArray([1, 2, 3, 4], [1, 4]);
+    const rmsMean = new RMSNorm(4).forward(x).toArray().reduce((s, v) => s + v, 0) / 4;
+    const lnMean = new LayerNorm(4).forward(x).toArray().reduce((s, v) => s + v, 0) / 4;
+    expect(lnMean).toBeCloseTo(0, 5);
+    expect(rmsMean).toBeGreaterThan(0.5);
+  });
+
+  it("has a gain but no bias", () => {
+    const params = new RMSNorm(8).parameters();
+    expect(params).toHaveLength(1);
+    expect(params[0].toArray()).toEqual(new Array(8).fill(1));
   });
 });

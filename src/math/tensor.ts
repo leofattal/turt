@@ -619,6 +619,87 @@ export class Tensor {
   }
 
   /**
+   * SiLU / swish: x * sigmoid(x). Smooth and non-monotonic, and unlike GELU it
+   * is cheap enough to be worth fusing. The gate activation in SwiGLU.
+   */
+  silu(): Tensor {
+    return Tensor.unary(
+      this,
+      (x) => x / (1 + Math.exp(-x)),
+      // y = x*s, so dy/dx = s + x*s*(1-s) = s + y*(1-s).
+      (x, y, g) => {
+        const s = 1 / (1 + Math.exp(-x));
+        return g * (s + y * (1 - s));
+      },
+    );
+  }
+
+  /**
+   * Rotary position embedding over a [groups, time, headDim] tensor.
+   *
+   * Each adjacent dimension pair (2i, 2i+1) is rotated by an angle proportional
+   * to its position, so a later dot product between a query and a key depends
+   * only on their *relative* distance. That replaces the learned position table
+   * with zero parameters, and — because nothing is looked up by absolute index —
+   * the model degrades gracefully past its trained context instead of running
+   * off the end of a table.
+   *
+   * The rotation is orthogonal, so the backward pass is just the inverse
+   * rotation (transpose = rotate by -theta).
+   */
+  rope(base = 10000): Tensor {
+    if (this.ndim !== 3) throw new Error(`rope expects a [groups, time, headDim] tensor, got ${this.ndim}-D`);
+    const [groups, t, hd] = this.shape;
+    if (hd % 2 !== 0) throw new Error(`rope requires an even headDim, got ${hd}`);
+    const half = hd / 2;
+
+    // cos/sin depend only on (position, pair), not on the data — computed once
+    // and reused by every group and by the backward pass.
+    const cos = new Float32Array(t * half);
+    const sin = new Float32Array(t * half);
+    for (let p = 0; p < t; p++) {
+      for (let i = 0; i < half; i++) {
+        const theta = p / Math.pow(base, (2 * i) / hd);
+        cos[p * half + i] = Math.cos(theta);
+        sin[p * half + i] = Math.sin(theta);
+      }
+    }
+
+    const data = new Float32Array(this.size);
+    for (let g = 0; g < groups; g++) {
+      for (let p = 0; p < t; p++) {
+        const off = (g * t + p) * hd;
+        for (let i = 0; i < half; i++) {
+          const c = cos[p * half + i];
+          const s = sin[p * half + i];
+          const x0 = this.data[off + 2 * i];
+          const x1 = this.data[off + 2 * i + 1];
+          data[off + 2 * i] = x0 * c - x1 * s;
+          data[off + 2 * i + 1] = x0 * s + x1 * c;
+        }
+      }
+    }
+
+    return Tensor.make(data, this.shape, [this], (grad) => {
+      if (!this.requiresGrad) return;
+      const ga = this.ensureGrad();
+      for (let g = 0; g < groups; g++) {
+        for (let p = 0; p < t; p++) {
+          const off = (g * t + p) * hd;
+          for (let i = 0; i < half; i++) {
+            const c = cos[p * half + i];
+            const s = sin[p * half + i];
+            const g0 = grad[off + 2 * i];
+            const g1 = grad[off + 2 * i + 1];
+            ga[off + 2 * i] += g0 * c + g1 * s;
+            ga[off + 2 * i + 1] += -g0 * s + g1 * c;
+          }
+        }
+      }
+    });
+  }
+
+  /**
    * Fused softmax + cross-entropy over logits [n, vocab] against integer class
    * targets, returning the mean loss as a scalar. Fusing avoids materializing
    * softmax probabilities in the graph and keeps the backward pass exact:
