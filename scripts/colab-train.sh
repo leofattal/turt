@@ -20,7 +20,7 @@ if [ ! -f data-big/train.bin ]; then
     tar xf "$DATA_TAR"
   else
     echo "=== building ${TARGET_GB}GB C4 corpus (first run only, ~1h) ==="
-    pnpm prepare-data-big --target-gb "$TARGET_GB"
+    npx -y tsx scripts/prepare-data-big.ts --target-gb "$TARGET_GB"
     if [ -d "$(dirname "$DATA_TAR")" ]; then
       echo "=== stashing corpus to $DATA_TAR so restarts skip the build ==="
       tar cf "$DATA_TAR" data-big/tokenizer.json data-big/meta.json data-big/train.bin data-big/val.bin

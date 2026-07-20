@@ -27,14 +27,15 @@ if ! vulkaninfo --summary 2>/dev/null | grep -qi nvidia; then
   exit 1
 fi
 
-echo "=== installing Deno + Node 22 + pnpm ==="
+echo "=== installing Deno + Node 22 ==="
 command -v deno > /dev/null || curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh > /dev/null
 node --version 2>/dev/null | grep -qE "^v(2[2-9]|[3-9][0-9])" || {
   curl -fsSL https://deb.nodesource.com/setup_22.x | bash - > /dev/null
   apt-get -qq install -y nodejs > /dev/null
 }
-command -v pnpm > /dev/null || npm install -g pnpm --silent
-pnpm install --silent
+# No package install: the trainer runs under Deno with zero npm deps, and
+# colab-train.sh runs the corpus builder via `npx -y tsx` (pnpm install has
+# been seen hanging indefinitely inside notebook shells).
 
 # Checkpoints must outlive the VM: keep them on Drive when it is mounted.
 if [ -d /content/drive/MyDrive ]; then
@@ -47,5 +48,5 @@ else
 fi
 
 echo "=== validating GPU kernels (bit-for-bit vs CPU engine) ==="
-pnpm gpu-gpt
+deno run --unstable-webgpu --unstable-sloppy-imports --allow-read scripts/gpu-gpt-validate.ts
 echo "=== setup OK ==="
