@@ -117,6 +117,9 @@ export class BPETokenizer implements Tokenizer {
         continue;
       }
       const ids = this.encodeChunk(chunk);
+      // Bound the memo: on corpus-scale input (billions of chars of web text)
+      // unique chunks otherwise grow without limit and exhaust the heap.
+      if (this.cache.size >= 1_000_000) this.cache.clear();
       this.cache.set(chunk, ids);
       for (const id of ids) out.push(id);
     }
