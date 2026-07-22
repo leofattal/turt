@@ -83,7 +83,7 @@ struct P { n:u32, bLen:u32, op:u32, accum:u32 };
 @group(0) @binding(3) var<uniform>             p: P;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) g: vec3<u32>) {
-  let i = g.x; if (i >= p.n) { return; }
+  let i = g.x + g.y*8388608u; if (i >= p.n) { return; }
   let bv = b[i % p.bLen];
   var r = a[i] + bv;
   if (p.op == 1u) { r = a[i] - bv; } else if (p.op == 2u) { r = a[i] * bv; }
@@ -99,7 +99,7 @@ struct P { n:u32, accum:u32, _a:u32, _b:u32, s:f32, _c:f32, _d:f32, _e:f32 };
 @group(0) @binding(2) var<uniform>             p: P;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) g: vec3<u32>) {
-  let i = g.x; if (i >= p.n) { return; }
+  let i = g.x + g.y*8388608u; if (i >= p.n) { return; }
   let r = a[i] * p.s;
   if (p.accum == 0u) { out[i] = r; } else { out[i] = out[i] + r; }
 }
@@ -113,7 +113,7 @@ struct P { n:u32, bLen:u32, _a:u32, _b:u32, s:f32, _c:f32, _d:f32, _e:f32 };
 @group(0) @binding(2) var<uniform>             p: P;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) g: vec3<u32>) {
-  let i = g.x; if (i >= p.n) { return; }
+  let i = g.x + g.y*8388608u; if (i >= p.n) { return; }
   out[i] = out[i] + src[i % p.bLen] * p.s;
 }
 `;
@@ -150,7 +150,7 @@ struct P { n:u32,_a:u32,_b:u32,_c:u32 };
 @group(0) @binding(1) var<storage, read_write> out: array<f32>;
 @group(0) @binding(2) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x; if(i>=p.n){return;} out[i]=max(x[i],0.0); }
+fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x+g.y*8388608u; if(i>=p.n){return;} out[i]=max(x[i],0.0); }
 `;
 const RELU_BWD = /* wgsl */ `
 struct P { n:u32,_a:u32,_b:u32,_c:u32 };
@@ -159,7 +159,7 @@ struct P { n:u32,_a:u32,_b:u32,_c:u32 };
 @group(0) @binding(2) var<storage, read_write> gIn: array<f32>;
 @group(0) @binding(3) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x; if(i>=p.n){return;} if(x[i]>0.0){ gIn[i]=gIn[i]+gOut[i]; } }
+fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x+g.y*8388608u; if(i>=p.n){return;} if(x[i]>0.0){ gIn[i]=gIn[i]+gOut[i]; } }
 `;
 
 /** SGD update: param[i] -= lr * grad[i]. */
@@ -169,7 +169,7 @@ struct P { n:u32,_a:u32,_b:u32,_c:u32, lr:f32,_d:f32,_e:f32,_f:f32 };
 @group(0) @binding(1) var<storage, read_write> param: array<f32>;
 @group(0) @binding(2) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x; if(i>=p.n){return;} param[i]=param[i]-p.lr*grad[i]; }
+fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x+g.y*8388608u; if(i>=p.n){return;} param[i]=param[i]-p.lr*grad[i]; }
 `;
 
 /** GELU (tanh approx, matching the CPU engine) forward and backward. */
@@ -180,7 +180,7 @@ struct P { n:u32,_a:u32,_b:u32,_c:u32 };
 @group(0) @binding(2) var<uniform> p: P;
 const C = 0.7978845608028654;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x; if(i>=p.n){return;}
+fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x+g.y*8388608u; if(i>=p.n){return;}
   let v = x[i]; out[i] = 0.5*v*(1.0+tanh(C*(v+0.044715*v*v*v))); }
 `;
 const GELU_BWD = /* wgsl */ `
@@ -191,7 +191,7 @@ struct P { n:u32,_a:u32,_b:u32,_c:u32 };
 @group(0) @binding(3) var<uniform> p: P;
 const C = 0.7978845608028654;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x; if(i>=p.n){return;}
+fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x+g.y*8388608u; if(i>=p.n){return;}
   let v = x[i];
   let inner = C*(v+0.044715*v*v*v);
   let t = tanh(inner);
@@ -206,7 +206,7 @@ struct P { n:u32,_a:u32,_b:u32,_c:u32 };
 @group(0) @binding(1) var<storage, read_write> out: array<f32>;
 @group(0) @binding(2) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x; if(i>=p.n){return;}
+fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x+g.y*8388608u; if(i>=p.n){return;}
   let v = x[i]; out[i] = v/(1.0+exp(-v)); }
 `;
 const SILU_BWD = /* wgsl */ `
@@ -216,7 +216,7 @@ struct P { n:u32,_a:u32,_b:u32,_c:u32 };
 @group(0) @binding(2) var<storage, read_write> gIn: array<f32>;
 @group(0) @binding(3) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x; if(i>=p.n){return;}
+fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x+g.y*8388608u; if(i>=p.n){return;}
   let v = x[i]; let s = 1.0/(1.0+exp(-v)); let y = v*s;
   gIn[i] = gIn[i] + gOut[i]*(s + y*(1.0-s)); }
 `;
@@ -378,7 +378,7 @@ struct P { groups:u32, t:u32, hd:u32, base:f32 };
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) g: vec3<u32>){
   let halfd = p.hd/2u;
-  let i = g.x; if(i >= p.groups*p.t*halfd){return;}
+  let i = g.x + g.y*8388608u; if(i >= p.groups*p.t*halfd){return;}
   let pair = i % halfd;
   let pos = (i/halfd) % p.t;
   let grp = i/(halfd*p.t);
@@ -399,7 +399,7 @@ struct P { groups:u32, t:u32, hd:u32, base:f32 };
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) g: vec3<u32>){
   let halfd = p.hd/2u;
-  let i = g.x; if(i >= p.groups*p.t*halfd){return;}
+  let i = g.x + g.y*8388608u; if(i >= p.groups*p.t*halfd){return;}
   let pair = i % halfd;
   let pos = (i/halfd) % p.t;
   let grp = i/(halfd*p.t);
@@ -420,7 +420,7 @@ struct P { n:u32, d:u32,_a:u32,_b:u32 };
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
 @group(0) @binding(3) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x; if(i>=p.n*p.d){return;}
+fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x+g.y*8388608u; if(i>=p.n*p.d){return;}
   let row=i/p.d; let col=i%p.d; out[i]=table[idx[row]*p.d+col]; }
 `;
 // One thread per vocab row scans all positions (cheap: V*N comparisons) and
@@ -477,7 +477,7 @@ struct P { groups:u32, t:u32,_a:u32,_b:u32 };
 @group(0) @binding(1) var<storage, read_write> out: array<f32>;
 @group(0) @binding(2) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x; if(i>=p.groups*p.t*p.t){return;}
+fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x+g.y*8388608u; if(i>=p.groups*p.t*p.t){return;}
   let within=i%(p.t*p.t); let row=within/p.t; let col=within%p.t;
   if(col>row){ out[i]=-1e9; } else { out[i]=x[i]; } }
 `;
@@ -487,7 +487,7 @@ struct P { groups:u32, t:u32,_a:u32,_b:u32 };
 @group(0) @binding(1) var<storage, read_write> gIn: array<f32>;
 @group(0) @binding(2) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x; if(i>=p.groups*p.t*p.t){return;}
+fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x+g.y*8388608u; if(i>=p.groups*p.t*p.t){return;}
   let within=i%(p.t*p.t); let row=within/p.t; let col=within%p.t;
   if(col<=row){ gIn[i]=gIn[i]+gOut[i]; } }
 `;
@@ -499,7 +499,7 @@ struct P { s0:u32,s1:u32,s2:u32,s3:u32, p0:u32,p1:u32,p2:u32,p3:u32, accum:u32, 
 @group(0) @binding(1) var<storage, read_write> out: array<f32>;
 @group(0) @binding(2) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) g: vec3<u32>){ let o=g.x; if(o>=p.n){return;}
+fn main(@builtin(global_invocation_id) g: vec3<u32>){ let o=g.x+g.y*8388608u; if(o>=p.n){return;}
   var inShape = array<u32,4>(p.s0,p.s1,p.s2,p.s3);
   var perm = array<u32,4>(p.p0,p.p1,p.p2,p.p3);
   var outShape = array<u32,4>(inShape[perm[0]],inShape[perm[1]],inShape[perm[2]],inShape[perm[3]]);
@@ -521,7 +521,7 @@ struct P { n:u32,_a:u32,_b:u32,_c:u32, lr:f32, beta1:f32, beta2:f32, eps:f32, wd
 @group(0) @binding(3) var<storage, read_write> v: array<f32>;
 @group(0) @binding(4) var<uniform> p: P;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x; if(i>=p.n){return;}
+fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x+g.y*8388608u; if(i>=p.n){return;}
   let gr = grad[i];
   m[i] = p.beta1*m[i] + (1.0-p.beta1)*gr;
   v[i] = p.beta2*v[i] + (1.0-p.beta2)*gr*gr;
@@ -584,6 +584,15 @@ export class GpuEngine {
   }
 
   private run(code: string, storages: GPUBuffer[], uniform: ArrayBufferView, gx: number, gy = 1, gz = 1): void {
+    // Vulkan caps workgroups at 65535 per dimension (Metal is far higher), so
+    // large flat dispatches fold into fixed 32768-wide rows; the flat kernels
+    // add g.y*8388608 (= 32768 workgroups * 256 threads) to their index. Only
+    // 1D dispatches can trip this: row-per-thread kernels stay orders of
+    // magnitude below the cap, and matmul grids are bounded by dims/TILE.
+    if (gy === 1 && gz === 1 && gx > 65535) {
+      gy = Math.ceil(gx / 32768);
+      gx = 32768;
+    }
     const pipeline = this.pipeline(code);
     const ubuf = this.device.createBuffer({
       size: Math.max(16, uniform.byteLength),
