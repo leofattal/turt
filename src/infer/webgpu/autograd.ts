@@ -609,6 +609,11 @@ export class GpuEngine {
     pass.dispatchWorkgroups(gx, gy, gz);
     pass.end();
     this.device.queue.submit([enc.finish()]);
+    // Destroy the uniform now that it is submitted (pending work keeps it
+    // alive). Vulkan drivers cap live memory allocations (~4k); leaving one
+    // uniform per dispatch to the JS GC blows past that cap within a few
+    // training steps on wgpu.
+    ubuf.destroy();
   }
 
   matmulInto(
@@ -782,6 +787,29 @@ export class GpuTensor {
   zeroGrad(): void {
     this.grad?.destroy();
     this.grad = null;
+  }
+  /**
+   * Destroy every non-leaf buffer (activations and their grads) in this
+   * tensor's autograd graph. Call once the step's reads are done: a training
+   * step allocates hundreds of intermediates, and waiting for the JS GC to
+   * release them exceeds the driver's live-allocation cap (~4k on Vulkan)
+   * within a few steps. Leaves — params and raw inputs — are untouched.
+   */
+  freeGraph(): void {
+    const stack: GpuTensor[] = [this];
+    const seen = new Set<GpuTensor>();
+    while (stack.length) {
+      const t = stack.pop()!;
+      if (seen.has(t) || !t.ctx) continue;
+      seen.add(t);
+      for (const p of t.ctx.parents) stack.push(p);
+      t.ctx = null;
+      t.buffer.destroy();
+      if (t.grad) {
+        t.grad.destroy();
+        t.grad = null;
+      }
+    }
   }
 
   private out(buffer: GPUBuffer, shape: number[], parents: GpuTensor[], backward: () => void): GpuTensor {
@@ -1097,6 +1125,9 @@ export class GpuTensor {
     e.total(perRow, sumBuf, rows);
     const lossBuf = e.buffer(1);
     e.scale(sumBuf, lossBuf, 1, 1 / rows, false);
+    // Forward-only scratch; the backward closure needs tgtBuf but not these.
+    perRow.destroy();
+    sumBuf.destroy();
     const a = this;
     const t = this.out(lossBuf, [1], [a], () => {
       if (a.requiresGrad) e.ceBwd(a.buffer, tgtBuf, t.grad!, a.ensureGrad(), rows, vocab);

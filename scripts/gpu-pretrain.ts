@@ -173,7 +173,9 @@ async function main(): Promise<void> {
     const n = 16;
     for (let i = 0; i < n; i++) {
       const [inp, tgt] = sampleBatch(valTokens, b, t, mulberry32(90000 + i));
-      total += (await engine.read(gpuModel.loss(inp, tgt, b, t).buffer, 1))[0];
+      const l = gpuModel.loss(inp, tgt, b, t);
+      total += (await engine.read(l.buffer, 1))[0];
+      l.freeGraph();
       for (const p of params) p.zeroGrad();
     }
     return total / n;
@@ -205,6 +207,7 @@ async function main(): Promise<void> {
       const eta = fmtDuration(((steps - step - 1) / done) * secs);
       console.log(`step ${(step + 1).toString().padStart(6)}/${steps}  loss ${l.toFixed(4)}  lr ${lr.toExponential(2)}  ${tokPerSec.toFixed(0)} tok/s  eta ${eta}`);
     }
+    loss.freeGraph();
 
     if ((step + 1) % evalEvery === 0 || step + 1 === steps) {
       const vl = await evalLoss();
