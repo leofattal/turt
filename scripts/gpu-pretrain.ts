@@ -67,10 +67,22 @@ function sampleBatch(tokens: Uint16Array, b: number, t: number, rng: () => numbe
   return [inp, tgt];
 }
 
-function cpuToGpu(engine: GpuEngine, cpu: GPT, gpu: GpuGPT): void {
+async function cpuToGpu(engine: GpuEngine, cpu: GPT, gpu: GpuGPT): Promise<void> {
   const cp = cpu.parameters();
   const gp = gpu.parameters();
-  for (let i = 0; i < cp.length; i++) engine.device.queue.writeBuffer(gp[i].buffer, 0, cp[i].data);
+  // Flush every ~16MB: unpolled writeBuffer staging accumulates in the small
+  // host-visible heap on discrete GPUs, and the full 134MB upload in one
+  // burst exhausts it (the ~250MB BAR window on the Colab T4).
+  let staged = 0;
+  for (let i = 0; i < cp.length; i++) {
+    engine.device.queue.writeBuffer(gp[i].buffer, 0, cp[i].data);
+    staged += cp[i].data.byteLength;
+    if (staged >= 16 * 1024 * 1024) {
+      await engine.reclaim();
+      staged = 0;
+    }
+  }
+  await engine.reclaim();
 }
 
 async function gpuToCpu(engine: GpuEngine, gpu: GpuGPT, cpu: GPT): Promise<void> {
@@ -123,7 +135,7 @@ async function main(): Promise<void> {
   }
 
   const engine = await GpuEngine.create();
-  const gpuModel = new GpuGPT(engine, config);
+  const gpuModel = new GpuGPT(engine, config, { skipInit: true });
   const cpuModel = new GPT(config, mulberry32(1337));
 
   let startStep = 0;
@@ -132,14 +144,13 @@ async function main(): Promise<void> {
     const m = await loadCheckpoint(join(CKPT_DIR, resumeName), cpuModel);
     startStep = m.step;
     bestVal = m.bestValLoss;
-    cpuToGpu(engine, cpuModel, gpuModel);
+    await cpuToGpu(engine, cpuModel, gpuModel);
     console.log(`Resumed from ${resumeName} at step ${startStep} (best val ${bestVal.toFixed(4)})`);
   } else {
     // Seed the GPU model from a fresh CPU model so the initialization is exactly
     // the well-tested CPU init (GPT-2 scaled-residual scheme), not the GPU's.
-    cpuToGpu(engine, cpuModel, gpuModel);
+    await cpuToGpu(engine, cpuModel, gpuModel);
   }
-  await engine.reclaim();
 
   const tokenizer = BPETokenizer.fromJSON(JSON.parse(await readFile(join(DATA_DIR, "tokenizer.json"), "utf8")));
   const trainTokens = await loadTokens("train.bin");

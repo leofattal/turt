@@ -60,17 +60,25 @@ export class GpuGPT {
   private readonly headScale: number;
   private readonly modern: boolean;
 
-  constructor(readonly engine: GpuEngine, readonly config: GPTConfig) {
+  constructor(readonly engine: GpuEngine, readonly config: GPTConfig, opts: { skipInit?: boolean } = {}) {
     const { vocabSize, blockSize, nEmbd, nLayer, nHead } = config;
     if (nEmbd % nHead !== 0) throw new Error("nEmbd must be divisible by nHead");
     this.modern = archOf(config) === "modern";
     this.headScale = 1 / Math.sqrt(nEmbd / nHead);
     const hidden = mlpHidden(config);
     let seed = 1;
+    // skipInit: allocate zeroed buffers without uploading anything — for
+    // callers that overwrite every parameter right away (trainer seeds from
+    // the CPU model). Staging ~134MB of init data in one synchronous burst
+    // overflows the host-visible heap on discrete GPUs before any poll can
+    // reclaim it, which poisons the device for the whole run.
+    const raw = (n: number, shape: number[]): GpuTensor => new GpuTensor(engine, engine.buffer(n), shape, true);
     const param = (n: number, shape: number[], std: number): GpuTensor =>
-      engine.tensor(gaussianArray(n, seed++, std), shape, true);
-    const zeros = (n: number, shape: number[]): GpuTensor => engine.tensor(new Float32Array(n), shape, true);
-    const ones = (n: number, shape: number[]): GpuTensor => engine.tensor(new Float32Array(n).fill(1), shape, true);
+      opts.skipInit ? raw(n, shape) : engine.tensor(gaussianArray(n, seed++, std), shape, true);
+    const zeros = (n: number, shape: number[]): GpuTensor =>
+      opts.skipInit ? raw(n, shape) : engine.tensor(new Float32Array(n), shape, true);
+    const ones = (n: number, shape: number[]): GpuTensor =>
+      opts.skipInit ? raw(n, shape) : engine.tensor(new Float32Array(n).fill(1), shape, true);
 
     this.wte = param(vocabSize * nEmbd, [vocabSize, nEmbd], INIT_STD);
     this.wpe = this.modern ? null : param(blockSize * nEmbd, [blockSize, nEmbd], INIT_STD);
