@@ -609,11 +609,33 @@ export class GpuEngine {
     pass.dispatchWorkgroups(gx, gy, gz);
     pass.end();
     this.device.queue.submit([enc.finish()]);
-    // Destroy the uniform now that it is submitted (pending work keeps it
-    // alive). Vulkan drivers cap live memory allocations (~4k); leaving one
-    // uniform per dispatch to the JS GC blows past that cap within a few
-    // training steps on wgpu.
-    ubuf.destroy();
+    this.free(ubuf);
+  }
+
+  private pendingFree: GPUBuffer[] = [];
+  private probe: GPUBuffer | null = null;
+  /**
+   * Queue a buffer for destruction at the next reclaim(). Never destroy() a
+   * buffer directly after submit: Deno's WebGPU defers the real wgpu queue
+   * submission, so an immediate destroy invalidates work that has not actually
+   * been handed off yet ("Buffer with '' label is invalid").
+   */
+  free(buf: GPUBuffer): void {
+    this.pendingFree.push(buf);
+  }
+  /**
+   * Force pending submissions through (a tiny readback is the only reliable
+   * device poll in Deno — onSubmittedWorkDone resolves without reclaiming),
+   * then destroy everything queued via free(). Call once per training step:
+   * a step allocates ~a thousand buffers (activations, grads, per-dispatch
+   * uniforms) and Vulkan drivers cap live allocations around 4k, so leaving
+   * them to the JS GC kills the run within a few steps.
+   */
+  async reclaim(): Promise<void> {
+    this.probe ??= this.buffer(1);
+    await this.read(this.probe, 1);
+    for (const b of this.pendingFree) b.destroy();
+    this.pendingFree.length = 0;
   }
 
   matmulInto(
@@ -785,7 +807,7 @@ export class GpuTensor {
     return this.grad;
   }
   zeroGrad(): void {
-    this.grad?.destroy();
+    if (this.grad) this.engine.free(this.grad);
     this.grad = null;
   }
   /**
@@ -804,9 +826,9 @@ export class GpuTensor {
       seen.add(t);
       for (const p of t.ctx.parents) stack.push(p);
       t.ctx = null;
-      t.buffer.destroy();
+      this.engine.free(t.buffer);
       if (t.grad) {
-        t.grad.destroy();
+        this.engine.free(t.grad);
         t.grad = null;
       }
     }
@@ -861,7 +883,7 @@ export class GpuTensor {
             const tmp = e.buffer(n);
             e.ewise(gC, a.buffer, tmp, n, n, 2, false);
             e.segsum(tmp, b.ensureGrad(), n, bLen, 1, true);
-            tmp.destroy();
+            e.free(tmp);
           }
         } else {
           e.segsum(gC, b.ensureGrad(), n, bLen, sign, true);
@@ -1126,8 +1148,8 @@ export class GpuTensor {
     const lossBuf = e.buffer(1);
     e.scale(sumBuf, lossBuf, 1, 1 / rows, false);
     // Forward-only scratch; the backward closure needs tgtBuf but not these.
-    perRow.destroy();
-    sumBuf.destroy();
+    e.free(perRow);
+    e.free(sumBuf);
     const a = this;
     const t = this.out(lossBuf, [1], [a], () => {
       if (a.requiresGrad) e.ceBwd(a.buffer, tgtBuf, t.grad!, a.ensureGrad(), rows, vocab);
