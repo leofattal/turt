@@ -139,6 +139,12 @@ async function main(): Promise<void> {
     // the well-tested CPU init (GPT-2 scaled-residual scheme), not the GPU's.
     cpuToGpu(engine, cpuModel, gpuModel);
   }
+  // Flush the queue so wgpu recycles writeBuffer staging memory. On discrete
+  // GPUs (NVIDIA/Vulkan) staging lives in the ~256MB host-visible BAR heap,
+  // and without a poll the belt grows until allocation fails mid-step — the
+  // weight upload above alone is a large fraction of that heap. Metal's
+  // unified memory never hits this, which is why it only bit on Colab.
+  await engine.device.queue.onSubmittedWorkDone();
 
   const tokenizer = BPETokenizer.fromJSON(JSON.parse(await readFile(join(DATA_DIR, "tokenizer.json"), "utf8")));
   const trainTokens = await loadTokens("train.bin");
@@ -187,6 +193,9 @@ async function main(): Promise<void> {
     for (let i = 0; i < params.length; i++) {
       engine.adamw(params[i].grad!, params[i].buffer, mBuf[i], vBuf[i], params[i].size, lr, 0.9, 0.999, 1e-8, 0.1, bc1, bc2);
     }
+    // Per-step queue flush: caps the staging belt at one step's uniforms and
+    // batch uploads instead of letting 20 steps of them pile up (see above).
+    await engine.device.queue.onSubmittedWorkDone();
 
     if ((step + 1) % 20 === 0) {
       const l = (await engine.read(loss.buffer, 1))[0];
