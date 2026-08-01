@@ -209,7 +209,13 @@ async function main(): Promise<void> {
       const done = step + 1 - startStep;
       const tokPerSec = (done * tokensPerStep) / secs;
       const eta = fmtDuration(((steps - step - 1) / done) * secs);
-      console.log(`step ${(step + 1).toString().padStart(6)}/${steps}  loss ${l.toFixed(4)}  lr ${lr.toExponential(2)}  ${tokPerSec.toFixed(0)} tok/s  eta ${eta}`);
+      console.log(`step ${(step + 1).toString().padStart(6)}/${steps}  loss ${l.toFixed(4)}  lr ${lr.toExponential(2)}  ${tokPerSec.toFixed(0)} tok/s  eta ${eta}  bufs ${engine.liveBuffers} (peak ${engine.peakLiveBuffers})`);
+      // A cross-entropy loss of exactly 0 is impossible; it means the loss
+      // buffer was invalid (Vulkan live-allocation cap) and the read saw a
+      // zero-filled staging buffer. Die loudly instead of training blind.
+      if (l === 0 || !Number.isFinite(l)) {
+        throw new Error(`loss read ${l} — GPU buffer allocation failure (live=${engine.liveBuffers}, peak=${engine.peakLiveBuffers})`);
+      }
     }
     loss.freeGraph();
     await engine.reclaim();

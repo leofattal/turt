@@ -533,13 +533,23 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>){ let i=g.x+g.y*8388608u; if
 interface Ctx {
   parents: GpuTensor[];
   backward: () => void;
+  /** Raw buffers the backward closure reads (index/target/norm stats); freed by freeGraph. */
+  scratch?: GPUBuffer[];
 }
 
 const wg = (n: number): number => Math.ceil(n / 256);
 
 export class GpuEngine {
   private pipelines = new Map<string, GPUComputePipeline>();
+  /** Live-allocation accounting: Vulkan drivers reject new buffers past ~4k live. */
+  liveBuffers = 0;
+  peakLiveBuffers = 0;
   private constructor(readonly device: GPUDevice) {}
+
+  private countCreate(): void {
+    this.liveBuffers++;
+    if (this.liveBuffers > this.peakLiveBuffers) this.peakLiveBuffers = this.liveBuffers;
+  }
 
   static async create(device?: GPUDevice): Promise<GpuEngine> {
     let dev = device;
@@ -577,6 +587,7 @@ export class GpuEngine {
   }
 
   buffer(elems: number): GPUBuffer {
+    this.countCreate();
     return this.device.createBuffer({
       size: Math.max(4, elems * 4),
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
@@ -594,10 +605,17 @@ export class GpuEngine {
       gx = 32768;
     }
     const pipeline = this.pipeline(code);
-    const ubuf = this.device.createBuffer({
-      size: Math.max(16, uniform.byteLength),
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
+    // One reusable uniform buffer per size class, overwritten each dispatch.
+    // queue.writeBuffer is ordered against submits, so dispatch N always sees
+    // its own values. A fresh ubuf per dispatch would add thousands of live
+    // allocations per training step — past Vulkan's ~4k cap, createBuffer
+    // starts returning invalid buffers and every kernel touching them no-ops.
+    const size = Math.max(16, uniform.byteLength);
+    let ubuf = this.ubufPool.get(size);
+    if (!ubuf) {
+      ubuf = this.device.createBuffer({ size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      this.ubufPool.set(size, ubuf);
+    }
     this.device.queue.writeBuffer(ubuf, 0, uniform.buffer, uniform.byteOffset, uniform.byteLength);
     const entries: GPUBindGroupEntry[] = storages.map((b, i) => ({ binding: i, resource: { buffer: b } }));
     entries.push({ binding: storages.length, resource: { buffer: ubuf } });
@@ -609,9 +627,9 @@ export class GpuEngine {
     pass.dispatchWorkgroups(gx, gy, gz);
     pass.end();
     this.device.queue.submit([enc.finish()]);
-    this.free(ubuf);
   }
 
+  private ubufPool = new Map<number, GPUBuffer>();
   private pendingFree: GPUBuffer[] = [];
   private probe: GPUBuffer | null = null;
   /**
@@ -634,7 +652,12 @@ export class GpuEngine {
   async reclaim(): Promise<void> {
     this.probe ??= this.buffer(1);
     await this.read(this.probe, 1);
-    for (const b of this.pendingFree) b.destroy();
+    // Dedupe: reshape() tensors share their parent's buffer, so freeGraph can
+    // queue the same GPUBuffer twice (double-destroy is a no-op, but it would
+    // skew the live-allocation count).
+    const uniq = new Set(this.pendingFree);
+    for (const b of uniq) b.destroy();
+    this.liveBuffers -= uniq.size;
     this.pendingFree.length = 0;
   }
 
@@ -676,6 +699,7 @@ export class GpuEngine {
   }
 
   indexBuffer(data: Uint32Array): GPUBuffer {
+    this.countCreate();
     const buf = this.device.createBuffer({
       size: Math.max(4, data.byteLength),
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
@@ -773,6 +797,7 @@ export class GpuEngine {
   }
 
   async read(buf: GPUBuffer, elems: number): Promise<Float32Array> {
+    this.countCreate();
     const staging = this.device.createBuffer({ size: elems * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const enc = this.device.createCommandEncoder();
     enc.copyBufferToBuffer(buf, 0, staging, 0, elems * 4);
@@ -781,6 +806,7 @@ export class GpuEngine {
     const out = new Float32Array(staging.getMappedRange().slice(0));
     staging.unmap();
     staging.destroy();
+    this.liveBuffers--;
     return out;
   }
   fill(buf: GPUBuffer, value: number, elems: number): void {
@@ -825,6 +851,7 @@ export class GpuTensor {
       if (seen.has(t) || !t.ctx) continue;
       seen.add(t);
       for (const p of t.ctx.parents) stack.push(p);
+      if (t.ctx.scratch) for (const b of t.ctx.scratch) this.engine.free(b);
       t.ctx = null;
       this.engine.free(t.buffer);
       if (t.grad) {
@@ -1040,6 +1067,8 @@ export class GpuTensor {
       if (a.requiresGrad) e.rmsDx(a.buffer, gC, gamma.buffer, rstd, a.ensureGrad(), rows, d, eps);
       if (gamma.requiresGrad) e.rmsDg(a.buffer, gC, rstd, gamma.ensureGrad(), rows, d);
     });
+    if (t.ctx) t.ctx.scratch = [rstd];
+    else e.free(rstd);
     return t;
   }
 
@@ -1116,6 +1145,8 @@ export class GpuTensor {
       if (a.requiresGrad) e.lnDx(a.buffer, gC, gamma.buffer, mean, rstd, a.ensureGrad(), rows, d, eps);
       if (gamma.requiresGrad) e.lnDgb(a.buffer, gC, mean, rstd, gamma.ensureGrad(), beta.ensureGrad(), rows, d);
     });
+    if (t.ctx) t.ctx.scratch = [mean, rstd];
+    else { e.free(mean); e.free(rstd); }
     return t;
   }
 
@@ -1131,6 +1162,8 @@ export class GpuTensor {
     const t = this.out(outBuf, [n, d], [a], () => {
       if (a.requiresGrad) e.gatherBwd(idxBuf, t.grad!, a.ensureGrad(), n, d, vocab);
     });
+    if (t.ctx) t.ctx.scratch = [idxBuf];
+    else e.free(idxBuf);
     return t;
   }
 
@@ -1154,6 +1187,8 @@ export class GpuTensor {
     const t = this.out(lossBuf, [1], [a], () => {
       if (a.requiresGrad) e.ceBwd(a.buffer, tgtBuf, t.grad!, a.ensureGrad(), rows, vocab);
     });
+    if (t.ctx) t.ctx.scratch = [tgtBuf];
+    else e.free(tgtBuf);
     return t;
   }
 
