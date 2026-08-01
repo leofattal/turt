@@ -114,6 +114,17 @@ async function main(): Promise<void> {
   };
   const b = numFlag("batch", 16);
   const t = config.blockSize;
+  // Deno's wgpu/Vulkan allocator on discrete GPUs rejects single buffers past
+  // ~128-200MB ("not enough memory left" on an idle 15GB T4), while total
+  // usage is effectively unlimited. The only tensor that can cross that line
+  // is the [batch*t, vocab] logits (and its grad), so split each step into
+  // micro-batches small enough to keep logits chunks near 64MB, accumulate
+  // grads, and run one optimizer step. Adam's m/sqrt(v) update is invariant
+  // to the constant grad-scale factor this introduces, so no lr change.
+  const maxRows = Math.floor((64 * 1024 * 1024) / 4 / config.vocabSize);
+  let micro = numFlag("micro", Math.min(b, Math.max(1, Math.floor(maxRows / t))));
+  while (b % micro !== 0) micro--;
+  const accum = b / micro;
   const steps = numFlag("steps", 20000);
   const peakLr = numFlag("lr", 6e-4);
   const minLrFrac = 0.1;
@@ -165,7 +176,7 @@ async function main(): Promise<void> {
   const tokensPerStep = b * t;
   console.log(`GPU pretraining a ${(nParams / 1e6).toFixed(2)}M-param GPT`);
   console.log(`  config: ${config.nLayer}L ${config.nHead}H ${config.nEmbd}E  block ${t}  vocab ${config.vocabSize}  arch ${config.arch}`);
-  console.log(`  ${steps} steps, batch ${b}x${t} = ${tokensPerStep} tok/step  (${((steps * tokensPerStep) / 1e6).toFixed(1)}M tokens total)`);
+  console.log(`  ${steps} steps, batch ${b}x${t} = ${tokensPerStep} tok/step${accum > 1 ? ` (${accum} micro-batches of ${micro})` : ""}  (${((steps * tokensPerStep) / 1e6).toFixed(1)}M tokens total)`);
   console.log(`  train ${(trainTokens.length / 1e6).toFixed(1)}M tok, val ${(valTokens.length / 1e6).toFixed(1)}M tok, peak lr ${peakLr}\n`);
 
   const lrAt = (step: number): number => {
@@ -178,8 +189,8 @@ async function main(): Promise<void> {
     let total = 0;
     const n = 16;
     for (let i = 0; i < n; i++) {
-      const [inp, tgt] = sampleBatch(valTokens, b, t, mulberry32(90000 + i));
-      const l = gpuModel.loss(inp, tgt, b, t);
+      const [inp, tgt] = sampleBatch(valTokens, micro, t, mulberry32(90000 + i));
+      const l = gpuModel.loss(inp, tgt, micro, t);
       total += (await engine.read(l.buffer, 1))[0];
       l.freeGraph();
       for (const p of params) p.zeroGrad();
@@ -192,9 +203,18 @@ async function main(): Promise<void> {
   let tstep = startStep;
   for (let step = startStep; step < steps; step++) {
     for (const p of params) p.zeroGrad();
-    const [inp, tgt] = sampleBatch(trainTokens, b, t, rng);
-    const loss = gpuModel.loss(inp, tgt, b, t);
-    loss.backward();
+    const printing = (step + 1) % 20 === 0;
+    let lossVal = NaN;
+    // Micro-batches accumulate into the params' grads (ensureGrad += in the
+    // backward kernels); one optimizer step follows.
+    for (let m = 0; m < accum; m++) {
+      const [inp, tgt] = sampleBatch(trainTokens, micro, t, rng);
+      const loss = gpuModel.loss(inp, tgt, micro, t);
+      loss.backward();
+      if (printing && m === accum - 1) lossVal = (await engine.read(loss.buffer, 1))[0];
+      loss.freeGraph();
+      await engine.reclaim();
+    }
     tstep++;
     const lr = lrAt(step);
     const bc1 = 1 - Math.pow(0.9, tstep);
@@ -203,22 +223,19 @@ async function main(): Promise<void> {
       engine.adamw(params[i].grad!, params[i].buffer, mBuf[i], vBuf[i], params[i].size, lr, 0.9, 0.999, 1e-8, 0.1, bc1, bc2);
     }
 
-    if ((step + 1) % 20 === 0) {
-      const l = (await engine.read(loss.buffer, 1))[0];
+    if (printing) {
       const secs = (performance.now() - start) / 1000;
       const done = step + 1 - startStep;
       const tokPerSec = (done * tokensPerStep) / secs;
       const eta = fmtDuration(((steps - step - 1) / done) * secs);
-      console.log(`step ${(step + 1).toString().padStart(6)}/${steps}  loss ${l.toFixed(4)}  lr ${lr.toExponential(2)}  ${tokPerSec.toFixed(0)} tok/s  eta ${eta}  bufs ${engine.liveBuffers} (peak ${engine.peakLiveBuffers})`);
+      console.log(`step ${(step + 1).toString().padStart(6)}/${steps}  loss ${lossVal.toFixed(4)}  lr ${lr.toExponential(2)}  ${tokPerSec.toFixed(0)} tok/s  eta ${eta}  bufs ${engine.liveBuffers} (peak ${engine.peakLiveBuffers})`);
       // A cross-entropy loss of exactly 0 is impossible; it means the loss
-      // buffer was invalid (Vulkan live-allocation cap) and the read saw a
+      // buffer was invalid (a failed GPU allocation) and the read saw a
       // zero-filled staging buffer. Die loudly instead of training blind.
-      if (l === 0 || !Number.isFinite(l)) {
-        throw new Error(`loss read ${l} — GPU buffer allocation failure (live=${engine.liveBuffers}, peak=${engine.peakLiveBuffers})`);
+      if (lossVal === 0 || !Number.isFinite(lossVal)) {
+        throw new Error(`loss read ${lossVal} — GPU buffer allocation failure (live=${engine.liveBuffers}, peak=${engine.peakLiveBuffers})`);
       }
     }
-    loss.freeGraph();
-    await engine.reclaim();
 
     if ((step + 1) % evalEvery === 0 || step + 1 === steps) {
       const vl = await evalLoss();
